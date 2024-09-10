@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import os
 
 def detect_faces(img, cascade):
     # converte pra gray scale, pra trabalhar melhor com o cascade
@@ -57,8 +58,10 @@ def redness_measure(image):
     B, G, R = cv2.split(image_float)
 
     # Calcula a  medida de vermelhidão a partir da formula do paper
-    redness = (R - np.minimum(B, G)) * 255 / (np.maximum(B, G) + 1) 
-    redness = np.clip(redness, 0, 255).astype(np.uint8)
+    redness = (R**2)/(G**2 + B **2 + 0.0001)
+
+    # Aplica o filtro: pixels com vermelhidão > 3 são definidos como 255, caso contrário, 0
+    redness = np.where(redness > 3, 255, 0).astype(np.uint8)
     
     return redness
 
@@ -78,8 +81,38 @@ def skin_color_removal(image):
     
     return non_skin_mask
 
-# Parâmetros: imagem, limite do vermelho, limite de proporcao de vermelho (obtido a partir de testes)
-def detect_red_eye(image, redness_threshold=150, redness_ratio_threshold=0.007):
+def shape_filtering(labels, stats, face_w, face_h):
+    # Definindo os parâmetros
+    Kwmin, Khmin = 1/50, 1/50
+    Kwmax, Khmax = 1/12, 1/12
+    
+    filtered_labels = np.zeros(labels.shape, dtype=np.uint8)
+    
+    # Itera sobre os componentes conectados (ignora o rótulo 0, que é o fundo)
+    for i in range(1, len(stats)):
+        wi = stats[i, cv2.CC_STAT_WIDTH]
+        hi = stats[i, cv2.CC_STAT_HEIGHT]
+        ai = stats[i, cv2.CC_STAT_AREA]
+
+        # Verifica largura e altura em relação ao rosto
+        if not (Kwmin * face_w <= wi <= Kwmax * face_w and
+                Khmin * face_h <= hi <= Khmax * face_h):
+            continue
+        
+        # Verifica razão largura/altura
+        if not (0.5 <= wi / hi <= 2):
+            continue
+        
+        # Verifica a compactação
+        if ai < (wi * hi) / 2:
+            continue
+        
+        # Se passou por todos os filtros, mantém o componente
+        filtered_labels[labels == i] = 255
+    
+    return filtered_labels
+
+def detect_red_eye(image, face):
     
     # detectando vermelhidao na imagem
     redness = redness_measure(image)
@@ -89,82 +122,86 @@ def detect_red_eye(image, redness_threshold=150, redness_ratio_threshold=0.007):
     
     # aplicando a mascara
     redness[non_skin_mask == 0] = 0
-
+    
     # preenchendo os espacos utilizando o "closing" operation
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     closed_redness = cv2.morphologyEx(redness, cv2.MORPH_CLOSE, kernel)
-
     # rotula os componentes conectados
-    num_labels, labels, _, _ = cv2.connectedComponentsWithStats(closed_redness, connectivity=4)
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(closed_redness, connectivity=4)
+    filtered_redness = shape_filtering(labels, stats, face.shape[1], face.shape[0])
 
-    # criando uma imagem "em branco" com o tamanho da imagem de entrada, do tipo RGB com 3 canais de cores
-    output = np.zeros((image.shape[0], image.shape[1], 3), dtype=np.uint8)
-    
-    # pegando a area total da imagem
-    total_eye_area = np.size(image, 0) * np.size(image, 1)
-    total_red_area = 0
-    
-    for i in range(1, num_labels):  # Começa em 1 porque 0 é o background
-        mask = (labels == i)
-        
-        # calculando numero de pixels "vermelhos"
-        red_pixels = redness[mask]
-        red_pixel_count = np.sum(red_pixels > redness_threshold)
-        
-        # area total vermelha
-        total_red_area += red_pixel_count
-        
-        # colocando cores pros labels
-        output[mask] = np.random.randint(0, 255, 3).tolist()
-
-    # proporcao de vermelho na area do olho
-    redness_ratio = total_red_area / total_eye_area
-
-    # resultado
-    # conclue se é vermelho de acordo com o limite determinado
-    is_red_eye = (redness_ratio > redness_ratio_threshold)
-
-    return output, redness, non_skin_mask, closed_redness, is_red_eye
-
+    return filtered_redness, redness, non_skin_mask, closed_redness
 
 def main():
-    # le a imagem
-    img = cv2.imread("../crianca.png")
     # algoritmo de detecções utilizados no código
     haar_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_frontalface_default.xml')
     eye_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_eye.xml')
     
-    # verificando se imagem foi carregada
-    if img is None:
-        print("Falha ao carregar imagem.")
-        return
-    
-    # detectando face
-    faces = detect_faces(img, haar_cascade)
-    
-    # tratando caso nenhuma face tenha sido detectada
-    if faces is None:
-        print("Nenhuma face detectada")
-        return
+    folder_path = '../figures'
+    files = os.listdir(folder_path)
+    png_files = [file for file in files if file.lower().endswith('.png')]
+    sorted_files = sorted(png_files)
+    number_of_eyes_detected = []
+    for file_name in sorted_files:
+        file_path = os.path.join(folder_path, file_name)
+        img = cv2.imread(file_path)
+        # img = cv2.imread('../figures/12.png')
+        # verificando se imagem foi carregada
+        if img is None:
+            print("Falha ao carregar imagem.")
+            return
+        
+        # detectando face
+        faces = detect_faces(img, haar_cascade)
+        face_w_redeyes_list = []
+        red_eye_highlight_list = []
+        
+        # tratando caso nenhuma face tenha sido detectada
+        if faces is None:
+            print("Nenhuma face detectada")
+            return
 
-    # loop principal
-    for face in faces:
-        # indentificando olhos para cada face indentificada
-        eyes = detect_eyes(face, eye_cascade)
-        for eye_coords in eyes:
-            if eye_coords is not None:
-                (x, y, w, h) = eye_coords
-                eye_img = face[y:y + h, x:x + w]
-                eye_img = cut_eyebrows(eye_img)
-                output, redness, non_skin_mask, closed_redness, is_red_eye = detect_red_eye(eye_img)
-                cv2.imshow('Original Image', eye_img)
-                cv2.imshow('Redness Detection', redness)
-                cv2.imshow('Non-Skin Mask', non_skin_mask)
-                cv2.imshow('Closed Redness', closed_redness)
-                cv2.imshow('Labeled Red-Eye Regions', output)
-                print(is_red_eye)
-                cv2.waitKey(0)
-    cv2.destroyAllWindows()
+        # loop principal
+        for face in faces:
+            # indentificando olhos para cada face indentificada
+            eyes = detect_eyes(face, eye_cascade)
+            red_eye_highlight = np.zeros_like(face)
+            face_w_redeyes = face.copy()
+            for eye_coords in eyes:
+                if eye_coords is not None:
+                    (x, y, w, h) = eye_coords
+                    eye_img1 = face[y:y + h, x:x + w]
+                    eye_img = cut_eyebrows(eye_img1)
+                    number_of_eyes_detected.append(eye_img)
+                    y = y + (eye_img1.shape[0] - eye_img.shape[0])
+                    output, redness, non_skin_mask, closed_redness = detect_red_eye(eye_img, face)
 
+                    red_eyes = cv2.merge((np.zeros_like(output), np.zeros_like(output), output))
+
+                    non_black_mask = np.any(red_eyes != [0, 0, 0], axis=-1)
+
+                    red_eye_highlight[y:y + eye_img.shape[0], x:x + w] = red_eyes
+                    face_w_redeyes[y:y + eye_img.shape[0], x:x + w][non_black_mask] = red_eyes[non_black_mask]
+
+            face_w_redeyes_list.append(face_w_redeyes)
+            red_eye_highlight_list.append(red_eye_highlight)
+        cv2.destroyAllWindows()
+        for i,face in enumerate(faces):
+            # mostrando face detectada 
+            cv2.imshow(f'Original Image {i}', face) 
+
+            # mostrando face com olhos vermlhos
+            if i < len(face_w_redeyes_list):
+                cv2.imshow(f'Image with Red Eyes {i}', face_w_redeyes_list[i]) 
+
+            # mostrando olhos vermelhos detectados
+            if i < len(red_eye_highlight_list):
+                cv2.imshow(f'Red Eyes Detected {i}', red_eye_highlight_list[i]) 
+
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()  # Close all windows after each image is displayed
+        cv2.destroyAllWindows()
+
+    print(len(number_of_eyes_detected))
 if __name__ == "__main__":
     main()
